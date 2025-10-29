@@ -44,7 +44,6 @@ def read_tickers(gc) -> List[str]:
     ws = sh.worksheet(TAB_NAME)
     col = ws.col_values(1)  # Column A
     tickers = [t.strip().upper() for t in col if t and t.strip()]
-    # Drop common header words if present
     if tickers and tickers[0] in ("TICKER", "TICKERS", "SYMBOL", "SYMBOLS"):
         tickers = tickers[1:]
     return tickers
@@ -74,29 +73,23 @@ def wait_for_parent_accept(trading: TradingClient, client_order_id: str):
     raise RuntimeError("Order not yet accepted")
 
 def validate_alpaca_or_exit(trading: TradingClient):
-    """
-    Validate credentials & environment before we touch the sheet.
-    If unauthorized, print helpful hints and exit with nonzero code.
-    """
     try:
         acct = trading.get_account()
         print(f"Alpaca auth OK. Account: {acct.account_number} | paper={ALPACA_PAPER}")
         return True
     except Exception as e:
-        msg = str(e)
         print("ERROR: Alpaca authentication failed.")
-        print(f"Detail: {msg}")
+        print(f"Detail: {e}")
         print("Quick checks:")
         print("  1) Ensure ALPACA_KEY_ID and ALPACA_SECRET_KEY are set correctly in Railway (no quotes/spaces).")
         print("  2) If these are PAPER keys, set ALPACA_PAPER=true. If LIVE keys, set ALPACA_PAPER=false.")
-        print("  3) If LIVE: confirm your live account is approved/enabled for trading.")
+        print("  3) If LIVE: confirm your live account is approved/enabled for trading (and fractionals if using them).")
         print("Aborting without changing your sheet.")
         return False
 
 def main():
     # ---- Clients
     trading = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=ALPACA_PAPER)
-    # Validate auth BEFORE reading/clearing sheet
     if not validate_alpaca_or_exit(trading):
         sys.exit(1)
 
@@ -115,23 +108,21 @@ def main():
             account = trading.get_account()
             buying_power = float(account.buying_power)
             alloc = buying_power * BUY_PERCENT
-            if alloc < 1.0:
-                print(f"Skipping {symbol}: allocation ${alloc:.2f} < $1 minimum.")
-                continue
 
+            # Minimum $1 notional for market orders w/ fractionals
+            alloc_rounded = round(max(alloc, 1.00), 2)   # CHANGED: use dollars (notional)
+
+            # Reference price for exit levels
             px = get_latest_price(data_client, symbol)
-            qty = math.floor(alloc / px)
-            if qty < 1:
-                print(f"Skipping {symbol}: allocation ${alloc:.2f} insufficient for 1 share at ~${px:.2f}.")
-                continue
-
             tp_price = round(px * (1.0 + TAKE_PROFIT_PCT), 2)
             sl_price = round(px * (1.0 - STOP_LOSS_PCT), 2)
+
             client_order_id = f"buy_{symbol}_{int(time.time())}"
 
+            # CHANGED: place bracket order with NOTIONAL instead of QTY (fractional-friendly)
             req = MarketOrderRequest(
                 symbol=symbol,
-                qty=qty,
+                notional=alloc_rounded,               # << key line for fractional $
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
                 order_class=OrderClass.BRACKET,
@@ -142,14 +133,14 @@ def main():
 
             order = trading.submit_order(req)
             wait_for_parent_accept(trading, client_order_id)
-            print(f"Placed BRACKET for {symbol}: qty={qty}, tp={tp_price}, sl={sl_price}")
+            print(f"Placed BRACKET (fractional) for {symbol}: notional=${alloc_rounded:.2f}, tp={tp_price}, sl={sl_price}")
             placed.append(symbol)
             time.sleep(0.5)
 
         except Exception as e:
+            # Common failure if fractionals not enabled for your account/asset
             print(f"Error placing order for {symbol}: {e}")
 
-    # ---- Only clear Column A if we actually placed at least one order
     if placed:
         try:
             clear_column_a(gc)
