@@ -1,5 +1,5 @@
 import os, json, time, math, sys
-from typing import List, Optional
+from typing import List
 from decimal import Decimal, ROUND_DOWN
 from tenacity import retry, wait_fixed, stop_after_attempt
 
@@ -79,12 +79,13 @@ def get_position_qty(trading: TradingClient, symbol: str) -> float:
     except Exception:
         return 0.0
 
-@retry(wait=wait_fixed(1), stop=stop_after_attempt(10))
-def wait_for_parent_accept(trading: TradingClient, client_order_id: str):
-    order = trading.get_order_by_client_order_id(client_order_id)
+@retry(wait=wait_fixed(1), stop=stop_after_attempt(15))
+def wait_for_order_accept_by_id(trading: TradingClient, order_id: str):
+    """Poll order by ID until it is accepted/new/filled/partially_filled."""
+    order = trading.get_order_by_id(order_id)
     if order.status in ("new", "accepted", "partially_filled", "filled", "done_for_day"):
         return order
-    raise RuntimeError("Order not yet accepted")
+    raise RuntimeError(f"Order {order_id} not yet accepted (status={order.status})")
 
 def validate_alpaca_or_exit(trading: TradingClient):
     try:
@@ -96,26 +97,25 @@ def validate_alpaca_or_exit(trading: TradingClient):
         print(f"Detail: {e}")
         print("Quick checks:")
         print("  1) Ensure ALPACA_KEY_ID and ALPACA_SECRET_KEY are set correctly in Railway (no quotes/spaces).")
-        print("  2) If these are PAPER keys, set ALPACA_PAPER=true. If LIVE keys, set ALPACA_PAPER=false.")
-        print("  3) Enable fractional trading on your account if using notional buys.")
+        print("  2) If PAPER keys, set ALPACA_PAPER=true. If LIVE keys, set ALPACA_PAPER=false.")
+        print("  3) Enable fractional trading if using notional buys.")
         print("Aborting without changing your sheet.")
         return False
 
 def place_fractional_buy(trading: TradingClient, symbol: str, notional: float) -> str:
-    client_order_id = f"buy_{symbol}_{int(time.time())}"
     req = MarketOrderRequest(
         symbol=symbol,
-        notional=round(notional, 2),     # fractional $ buy
+        notional=round(max(notional, 1.00), 2),  # fractional $ buy, min $1
         side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY,
     )
-    trading.submit_order(req)
-    return client_order_id
+    order = trading.submit_order(req)
+    return str(order.id)
 
 def place_oco_sell(trading: TradingClient, symbol: str, qty: float, tp_price: float, sl_price: float):
     # OCO requires qty, not notional; supports fractional qty for equities
     qty_str = dquant6(qty)
-    req = MarketOrderRequest(  # Alpaca-py uses MarketOrderRequest for OCO container
+    req = MarketOrderRequest(  # container for OCO legs
         symbol=symbol,
         qty=qty_str,
         side=OrderSide.SELL,
@@ -155,8 +155,8 @@ def main():
             qty_before = get_position_qty(trading, symbol)
 
             # 1) Fractional buy (simple order)
-            buy_coid = place_fractional_buy(trading, symbol, alloc)
-            wait_for_parent_accept(trading, buy_coid)
+            buy_order_id = place_fractional_buy(trading, symbol, alloc)
+            wait_for_order_accept_by_id(trading, buy_order_id)
 
             # 2) Poll for fill & delta qty
             qty_after = qty_before
