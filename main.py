@@ -114,8 +114,7 @@ def main():
 
     print(f"📈 Found {len(tickers_to_process)} ticker(s): {[t for _, t in tickers_to_process]}")
 
-    next_log_row = first_empty_row(ws, col=3, start_row=2)
-    log_rows = []  # [[ticker, cost/status]]
+    log_rows = []  # [[ticker, avg_entry_price]]
 
     for _, ticker in tickers_to_process:
         try:
@@ -131,9 +130,24 @@ def main():
             order = api.submit_order(
                 symbol=ticker, side="buy", type="market", time_in_force="day", notional=float(notional)
             )
-
             print(f"✅ Submitted BUY {ticker} for ${notional} (Order ID: {order.id})")
-            log_rows.append([ticker, f"{notional}"])
+
+            # Wait for fill and fetch avg_entry_price
+            avg_entry_price = None
+            for attempt in range(10):  # retry up to ~10 seconds
+                try:
+                    pos = api.get_position(ticker)
+                    avg_entry_price = pos.avg_entry_price
+                    break
+                except Exception:
+                    time.sleep(1)
+
+            if avg_entry_price:
+                print(f"📊 {ticker} avg_entry_price: ${avg_entry_price}")
+                log_rows.append([ticker, avg_entry_price])
+            else:
+                print(f"⚠️  Could not fetch avg_entry_price for {ticker}")
+                log_rows.append([ticker, "N/A"])
 
         except Exception as e:
             err = f"ERROR: {e}"
@@ -142,12 +156,12 @@ def main():
 
         time.sleep(0.4)
 
-    # write logs to the next open rows in C:D
+    # write logs to next open rows in C:D
     if log_rows:
         first_row = first_empty_row(ws, col=3, start_row=2)
         last_row = first_row + len(log_rows) - 1
         ws.update(f"C{first_row}:D{last_row}", log_rows, value_input_option="RAW")
-        print(f"📝 Logged {len(log_rows)} rows to C{first_row}:D{last_row}")
+        print(f"📝 Logged {len(log_rows)} rows with avg_entry_price to C{first_row}:D{last_row}")
 
     # clear all of column A
     try:
