@@ -1,5 +1,6 @@
 import os, json, time, math, sys
-from typing import List
+from typing import List, Optional
+from decimal import Decimal, ROUND_DOWN
 from tenacity import retry, wait_fixed, stop_after_attempt
 
 # -------- Alpaca --------
@@ -10,6 +11,7 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
     StopLossRequest,
 )
+from alpaca.trading.models import Position
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
 
@@ -27,8 +29,13 @@ ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower().strip() in ("1", "true"
 GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
 
 BUY_PERCENT = float(os.getenv("BUY_PERCENT", "0.07"))          # 7% per ticker
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.03"))      # 3%
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.05"))  # +5%
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.03"))      # 3% stop
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.05"))  # +5% TP
+
+# ---- helpers
+def dquant6(x: float) -> str:
+    """Quantize to 6 decimal places as string for fractional qty."""
+    return str(Decimal(x).quantize(Decimal("0.000001"), rounding=ROUND_DOWN))
 
 def get_gspread_client():
     info = json.loads(GOOGLE_CREDS_JSON)
@@ -65,6 +72,13 @@ def get_latest_price(client: StockHistoricalDataClient, symbol: str) -> float:
         return float(s.latest_minute_bar.close)
     raise RuntimeError(f"Could not get a current price for {symbol}")
 
+def get_position_qty(trading: TradingClient, symbol: str) -> float:
+    try:
+        p: Position = trading.get_open_position(symbol)
+        return float(p.qty)
+    except Exception:
+        return 0.0
+
 @retry(wait=wait_fixed(1), stop=stop_after_attempt(10))
 def wait_for_parent_accept(trading: TradingClient, client_order_id: str):
     order = trading.get_order_by_client_order_id(client_order_id)
@@ -83,9 +97,34 @@ def validate_alpaca_or_exit(trading: TradingClient):
         print("Quick checks:")
         print("  1) Ensure ALPACA_KEY_ID and ALPACA_SECRET_KEY are set correctly in Railway (no quotes/spaces).")
         print("  2) If these are PAPER keys, set ALPACA_PAPER=true. If LIVE keys, set ALPACA_PAPER=false.")
-        print("  3) If LIVE: confirm your live account is approved/enabled for trading (and fractionals if using them).")
+        print("  3) Enable fractional trading on your account if using notional buys.")
         print("Aborting without changing your sheet.")
         return False
+
+def place_fractional_buy(trading: TradingClient, symbol: str, notional: float) -> str:
+    client_order_id = f"buy_{symbol}_{int(time.time())}"
+    req = MarketOrderRequest(
+        symbol=symbol,
+        notional=round(notional, 2),     # fractional $ buy
+        side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY,
+    )
+    trading.submit_order(req)
+    return client_order_id
+
+def place_oco_sell(trading: TradingClient, symbol: str, qty: float, tp_price: float, sl_price: float):
+    # OCO requires qty, not notional; supports fractional qty for equities
+    qty_str = dquant6(qty)
+    req = MarketOrderRequest(  # Alpaca-py uses MarketOrderRequest for OCO container
+        symbol=symbol,
+        qty=qty_str,
+        side=OrderSide.SELL,
+        time_in_force=TimeInForce.GTC,
+        order_class=OrderClass.OCO,
+        take_profit=TakeProfitRequest(limit_price=round(tp_price, 2)),
+        stop_loss=StopLossRequest(stop_price=round(sl_price, 2)),
+    )
+    trading.submit_order(req)
 
 def main():
     # ---- Clients
@@ -102,55 +141,62 @@ def main():
         print("No tickers found in column A; exiting.")
         return
 
-    placed = []
+    placed_ocos = []
     for symbol in tickers:
         try:
             account = trading.get_account()
             buying_power = float(account.buying_power)
             alloc = buying_power * BUY_PERCENT
+            if alloc < 1.0:
+                print(f"Skipping {symbol}: allocation ${alloc:.2f} < $1 minimum.")
+                continue
 
-            # Minimum $1 notional for market orders w/ fractionals
-            alloc_rounded = round(max(alloc, 1.00), 2)   # CHANGED: use dollars (notional)
+            # Pre-buy position qty to compute delta
+            qty_before = get_position_qty(trading, symbol)
 
-            # Reference price for exit levels
+            # 1) Fractional buy (simple order)
+            buy_coid = place_fractional_buy(trading, symbol, alloc)
+            wait_for_parent_accept(trading, buy_coid)
+
+            # 2) Poll for fill & delta qty
+            qty_after = qty_before
+            for _ in range(60):  # up to ~60s
+                time.sleep(1)
+                qty_after = get_position_qty(trading, symbol)
+                if qty_after > qty_before:
+                    break
+
+            delta_qty = max(0.0, qty_after - qty_before)
+            if delta_qty <= 0.0:
+                print(f"Warning: {symbol} fractional buy not reflected in position yet; skipping OCO.")
+                continue
+
+            # Reference price for exits (latest)
             px = get_latest_price(data_client, symbol)
-            tp_price = round(px * (1.0 + TAKE_PROFIT_PCT), 2)
-            sl_price = round(px * (1.0 - STOP_LOSS_PCT), 2)
+            tp_price = px * (1.0 + TAKE_PROFIT_PCT)
+            sl_price = px * (1.0 - STOP_LOSS_PCT)
 
-            client_order_id = f"buy_{symbol}_{int(time.time())}"
+            # 3) OCO for the delta qty (GTC)
+            place_oco_sell(trading, symbol, delta_qty, tp_price, sl_price)
+            print(f"Placed OCO for {symbol}: qty={dquant6(delta_qty)}, tp=~{tp_price:.2f}, sl=~{sl_price:.2f}")
+            placed_ocos.append(symbol)
 
-            # CHANGED: place bracket order with NOTIONAL instead of QTY (fractional-friendly)
-            req = MarketOrderRequest(
-                symbol=symbol,
-                notional=alloc_rounded,               # << key line for fractional $
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-                order_class=OrderClass.BRACKET,
-                take_profit=TakeProfitRequest(limit_price=tp_price),
-                stop_loss=StopLossRequest(stop_price=sl_price),
-                client_order_id=client_order_id,
-            )
-
-            order = trading.submit_order(req)
-            wait_for_parent_accept(trading, client_order_id)
-            print(f"Placed BRACKET (fractional) for {symbol}: notional=${alloc_rounded:.2f}, tp={tp_price}, sl={sl_price}")
-            placed.append(symbol)
             time.sleep(0.5)
 
         except Exception as e:
-            # Common failure if fractionals not enabled for your account/asset
-            print(f"Error placing order for {symbol}: {e}")
+            print(f"Error processing {symbol}: {e}")
 
-    if placed:
+    # ---- Clear Column A only if we placed at least one OCO
+    if placed_ocos:
         try:
             clear_column_a(gc)
             print("Cleared Column A in 'Alpaca Integration'.")
         except Exception as e:
             print(f"Warning: failed to clear Column A — {e}")
     else:
-        print("No successful orders placed; Column A left unchanged.")
+        print("No successful OCOs placed; Column A left unchanged.")
 
-    print(f"Done. Placed orders for: {placed}")
+    print(f"Done. Placed OCOs for: {placed_ocos}")
 
 if __name__ == "__main__":
     main()
