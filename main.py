@@ -1,4 +1,4 @@
-import os, json, time, math, sys
+import os, json, time, math, sys, traceback
 from typing import List
 from decimal import Decimal, ROUND_DOWN
 from tenacity import retry, wait_fixed, stop_after_attempt
@@ -10,6 +10,7 @@ from alpaca.trading.requests import (
     MarketOrderRequest,
     TakeProfitRequest,
     StopLossRequest,
+    OrderRequest,  # <-- use a neutral request type for OCO
 )
 from alpaca.trading.models import Position
 from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -103,19 +104,21 @@ def validate_alpaca_or_exit(trading: TradingClient):
         return False
 
 def place_fractional_buy(trading: TradingClient, symbol: str, notional: float) -> str:
+    notional_amt = round(max(notional, 1.00), 2)
     req = MarketOrderRequest(
         symbol=symbol,
-        notional=round(max(notional, 1.00), 2),  # fractional $ buy, min $1
+        notional=notional_amt,  # fractional $ buy, min $1
         side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY,
     )
     order = trading.submit_order(req)
+    print(f"[BUY] {symbol}: notional=${notional_amt:.2f} -> order_id={order.id}")
     return str(order.id)
 
 def place_oco_sell(trading: TradingClient, symbol: str, qty: float, tp_price: float, sl_price: float):
-    # OCO requires qty, not notional; supports fractional qty for equities
+    # Use a neutral OrderRequest so the API doesn't force 'market'
     qty_str = dquant6(qty)
-    req = MarketOrderRequest(  # container for OCO legs
+    req = OrderRequest(
         symbol=symbol,
         qty=qty_str,
         side=OrderSide.SELL,
@@ -124,7 +127,8 @@ def place_oco_sell(trading: TradingClient, symbol: str, qty: float, tp_price: fl
         take_profit=TakeProfitRequest(limit_price=round(tp_price, 2)),
         stop_loss=StopLossRequest(stop_price=round(sl_price, 2)),
     )
-    trading.submit_order(req)
+    order = trading.submit_order(req)
+    print(f"[OCO] {symbol}: qty={qty_str} tp={tp_price:.2f} sl={sl_price:.2f} -> order_id={order.id}")
 
 def main():
     # ---- Clients
@@ -147,12 +151,14 @@ def main():
             account = trading.get_account()
             buying_power = float(account.buying_power)
             alloc = buying_power * BUY_PERCENT
+            print(f"[ALLOC] {symbol}: buying_power={buying_power:.2f} BUY_PERCENT={BUY_PERCENT:.4f} alloc=${alloc:.2f}")
             if alloc < 1.0:
                 print(f"Skipping {symbol}: allocation ${alloc:.2f} < $1 minimum.")
                 continue
 
             # Pre-buy position qty to compute delta
             qty_before = get_position_qty(trading, symbol)
+            print(f"[POS] {symbol}: qty_before={qty_before}")
 
             # 1) Fractional buy (simple order)
             buy_order_id = place_fractional_buy(trading, symbol, alloc)
@@ -160,13 +166,15 @@ def main():
 
             # 2) Poll for fill & delta qty
             qty_after = qty_before
-            for _ in range(60):  # up to ~60s
+            for i in range(60):  # up to ~60s
                 time.sleep(1)
                 qty_after = get_position_qty(trading, symbol)
+                print(f"[POLL] {symbol}: i={i} qty_after={qty_after}")
                 if qty_after > qty_before:
                     break
 
             delta_qty = max(0.0, qty_after - qty_before)
+            print(f"[DELTA] {symbol}: delta_qty={delta_qty}")
             if delta_qty <= 0.0:
                 print(f"Warning: {symbol} fractional buy not reflected in position yet; skipping OCO.")
                 continue
@@ -175,16 +183,17 @@ def main():
             px = get_latest_price(data_client, symbol)
             tp_price = px * (1.0 + TAKE_PROFIT_PCT)
             sl_price = px * (1.0 - STOP_LOSS_PCT)
+            print(f"[PX] {symbol}: latest={px:.4f} -> TP={tp_price:.4f} SL={sl_price:.4f}")
 
             # 3) OCO for the delta qty (GTC)
             place_oco_sell(trading, symbol, delta_qty, tp_price, sl_price)
-            print(f"Placed OCO for {symbol}: qty={dquant6(delta_qty)}, tp=~{tp_price:.2f}, sl=~{sl_price:.2f}")
             placed_ocos.append(symbol)
 
             time.sleep(0.5)
 
         except Exception as e:
-            print(f"Error processing {symbol}: {e}")
+            print(f"[ERROR] {symbol}: {e}")
+            traceback.print_exc()
 
     # ---- Clear Column A only if we placed at least one OCO
     if placed_ocos:
