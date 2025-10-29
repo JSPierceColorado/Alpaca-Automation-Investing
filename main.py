@@ -5,7 +5,11 @@ from tenacity import retry, wait_fixed, stop_after_attempt
 # -------- Alpaca --------
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import (
+    MarketOrderRequest,
+    TakeProfitRequest,
+    StopLossRequest,
+)
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
 
@@ -19,14 +23,12 @@ TAB_NAME = os.getenv("TAB_NAME", "Alpaca Integration")
 ALPACA_KEY = os.environ["ALPACA_KEY_ID"]
 ALPACA_SECRET = os.environ["ALPACA_SECRET_KEY"]
 # If you use paper trading, set ALPACA_PAPER=true in Railway
-ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() in ("1","true","yes")
-# Optional: override base URL if needed
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL")  # usually not needed with paper=True
+ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() in ("1", "true", "yes")
 
 GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
 
-BUY_PERCENT = float(os.getenv("BUY_PERCENT", "0.07"))   # 7% per ticker
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.03"))  # 3%
+BUY_PERCENT = float(os.getenv("BUY_PERCENT", "0.07"))       # 7% per ticker
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.03"))   # 3%
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.05"))  # +5%
 
 # -------- Helpers --------
@@ -45,6 +47,11 @@ def read_tickers(gc) -> List[str]:
     col = ws.col_values(1)  # Column A
     # Strip header if present and remove blanks
     tickers = [t.strip().upper() for t in col if t and t.strip()]
+    # If the first cell is a header like "Ticker", drop it
+    if tickers and not tickers[0].isalpha():
+        tickers = tickers[1:]
+    if tickers and tickers[0] in ("TICKER", "TICKERS", "SYMBOL", "SYMBOLS"):
+        tickers = tickers[1:]
     return tickers
 
 def clear_column_a(gc):
@@ -60,11 +67,11 @@ def get_latest_price(client: StockHistoricalDataClient, symbol: str) -> float:
     snap = client.get_stock_snapshot(req)
     s = snap[symbol]
     # Prefer latest trade price; fall back to latest quote mid or last minute bar close
-    if s.latest_trade:
+    if getattr(s, "latest_trade", None):
         return float(s.latest_trade.price)
-    if s.latest_quote:
+    if getattr(s, "latest_quote", None):
         return float((s.latest_quote.ask_price + s.latest_quote.bid_price) / 2.0)
-    if s.latest_minute_bar:
+    if getattr(s, "latest_minute_bar", None):
         return float(s.latest_minute_bar.close)
     raise RuntimeError(f"Could not get a current price for {symbol}")
 
@@ -72,13 +79,13 @@ def get_latest_price(client: StockHistoricalDataClient, symbol: str) -> float:
 def wait_for_parent_accept(trading: TradingClient, client_order_id: str):
     # lightweight poll so we can at least observe acceptance before exiting
     order = trading.get_order_by_client_order_id(client_order_id)
-    if order.status in ("new","accepted","partially_filled","filled","done_for_day"):
+    if order.status in ("new", "accepted", "partially_filled", "filled", "done_for_day"):
         return order
     raise RuntimeError("Order not yet accepted")
 
 def main():
     # ---- Clients
-    trading = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=ALPACA_PAPER, url=ALPACA_BASE_URL)
+    trading = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=ALPACA_PAPER)
     data_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
     gc = get_gspread_client()
 
@@ -118,8 +125,8 @@ def main():
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
                 order_class=OrderClass.BRACKET,
-                take_profit={"limit_price": tp_price},
-                stop_loss={"stop_price": sl_price},
+                take_profit=TakeProfitRequest(limit_price=tp_price),
+                stop_loss=StopLossRequest(stop_price=sl_price),
                 client_order_id=client_order_id,
             )
 
